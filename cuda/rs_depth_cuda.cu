@@ -1,10 +1,11 @@
 /* rs_depth_cuda.cu — CUDA close-range depth improver, vendor-ABI compatible.
  *
- * Pipeline mirrors rs_depth/improver.py (CPU): box-downscale the IR pair,
+ * Box-downscale the IR pair,
  * census-5x5 + winner-take-all stereo over the near disparity band,
  * disparity -> depth, 5x5 median, nearest-upscale merged with HW depth.
  *
- * Builds a drop-in `librs_depth_range.so` (same 4 C symbols, same structs).
+ * Retains the vendor's four C entry points and metadata layout, plus a
+ * project-specific configure() extension. Only zero HW depths are filled.
  * No librealsense dependency. Requires CUDA 12.8+ for sm_120 (Blackwell).
  */
 
@@ -13,9 +14,9 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <climits>
 #include <cstdio>
-#include <cstring>
-#include <string>
+#include <new>
 
 #define CUDA_OK(call, h, msg) do {                                    \
     cudaError_t _e = (call);                                          \
@@ -34,6 +35,7 @@ struct RsDepthRangeImpl {
   int crop[4] = {-1, -1, -1, -1};
   float zmin_m = 0.12f;
   int uniqueness = 10;  /* percent, same convention as OpenCV SGBM */
+  bool use_median = true;
 
   int w = 0, h = 0, ws = 0, hs = 0;  /* cached geometry */
   uint8_t *d_il = nullptr, *d_ir = nullptr;    /* scaled IR */
@@ -44,9 +46,7 @@ struct RsDepthRangeImpl {
   char err[256] = {0};
 };
 
-static int auto_threshold(float f, float b) {
-  return (int)(f * b * 1000.0f / 105.0f);
-}
+static thread_local char create_error[256] = {0};
 
 static void free_bufs(RsDepthRangeImpl *h) {
   cudaFree(h->d_il); cudaFree(h->d_ir);
@@ -152,9 +152,8 @@ __global__ void k_merge(const float *z, int ws, int hs,
     int sx = x * ws / W, sy = y * hs / H;
     float zc = z[sy * ws + sx];
     int zi = (int)(zc + 0.5f);
-    int hwi = (int)keep;
     if (zc > 0.0f && zi >= floor_mm && zi < thresh_mm &&
-        (hwi == 0 || hwi >= thresh_mm))
+        keep == 0)
       keep = (uint16_t)zi;
   }
   out[y * W + x] = keep;
@@ -168,15 +167,50 @@ RsDepthRange rs_depth_range_create(float focal_length_px, float baseline_m,
                                    int min_z_threshold, float scale_factor,
                                    int crop_x1, int crop_y1,
                                    int crop_x2, int crop_y2) {
-  auto *h = new RsDepthRangeImpl();
+  create_error[0] = '\0';
+  double threshold = min_z_threshold > 0 ? min_z_threshold
+      : (double)focal_length_px * baseline_m * 1000.0 / 105.0;
+  if (!std::isfinite(focal_length_px) || focal_length_px <= 0 ||
+      !std::isfinite(baseline_m) || baseline_m <= 0 ||
+      !std::isfinite(threshold) || threshold < 1 || threshold > 65535 ||
+      !std::isfinite(scale_factor) || scale_factor <= 0 || scale_factor > 1) {
+    snprintf(create_error, sizeof(create_error), "invalid calibration, threshold, or scale");
+    return nullptr;
+  }
+  bool no_crop = crop_x1 == -1 && crop_y1 == -1 && crop_x2 == -1 && crop_y2 == -1;
+  if (!no_crop && !(crop_x1 >= 0 && crop_y1 >= 0 &&
+                    crop_x2 > crop_x1 && crop_y2 > crop_y1)) {
+    snprintf(create_error, sizeof(create_error), "invalid crop region");
+    return nullptr;
+  }
+  auto *h = new (std::nothrow) RsDepthRangeImpl();
+  if (!h) {
+    snprintf(create_error, sizeof(create_error), "handle allocation failed");
+    return nullptr;
+  }
   h->focal_px = focal_length_px;
   h->baseline_m = baseline_m;
-  h->min_z_mm = min_z_threshold > 0 ? min_z_threshold
-                                    : auto_threshold(focal_length_px, baseline_m);
-  h->scale = (scale_factor > 0.0f && scale_factor <= 1.0f) ? scale_factor : 0.35f;
+  h->min_z_mm = (int)threshold;
+  h->zmin_m = baseline_m < 0.03f ? 0.02f : 0.12f;
+  h->scale = scale_factor;
   h->crop[0] = crop_x1; h->crop[1] = crop_y1;
   h->crop[2] = crop_x2; h->crop[3] = crop_y2;
   return h;
+}
+
+int rs_depth_range_configure(RsDepthRange h, float min_depth_m, int use_median) {
+  auto *H = (RsDepthRangeImpl *)h;
+  if (!H) return -1;
+  if (!std::isfinite(min_depth_m) || min_depth_m <= 0 ||
+      min_depth_m * 1000.0f >= H->min_z_mm ||
+      (use_median != 0 && use_median != 1)) {
+    snprintf(H->err, sizeof(H->err), "invalid minimum depth or median setting");
+    return -1;
+  }
+  H->zmin_m = min_depth_m;
+  H->use_median = use_median != 0;
+  H->err[0] = '\0';
+  return 0;
 }
 
 void rs_depth_range_destroy(RsDepthRange h) {
@@ -186,7 +220,7 @@ void rs_depth_range_destroy(RsDepthRange h) {
 }
 
 const char *rs_depth_range_last_error(RsDepthRange h) {
-  if (!h) return "invalid handle";
+  if (!h) return create_error[0] ? create_error : "invalid handle";
   return ((RsDepthRangeImpl *)h)->err;
 }
 
@@ -199,8 +233,17 @@ int rs_depth_range_process(RsDepthRange h, const uint8_t *ir_left,
     return -1;
   }
   int W = meta->width, Ht = meta->height;
-  if (W <= 0 || Ht <= 0) {
+  if (W <= 0 || Ht <= 0 || (size_t)W * Ht > INT_MAX) {
     snprintf(H->err, sizeof(H->err), "bad metadata dims %dx%d", W, Ht);
+    return -1;
+  }
+  bool use_crop = H->crop[0] >= 0;
+  if (use_crop && (H->crop[2] > W || H->crop[3] > Ht)) {
+    snprintf(H->err, sizeof(H->err), "crop region exceeds image dimensions");
+    return -1;
+  }
+  if (H->zmin_m * 1000.0f >= H->min_z_mm) {
+    snprintf(H->err, sizeof(H->err), "minimum depth must be below threshold");
     return -1;
   }
   int ws = H->scale >= 1.0f ? W : (int)(W * H->scale + 0.5f);
@@ -208,13 +251,14 @@ int rs_depth_range_process(RsDepthRange h, const uint8_t *ir_left,
   if (ws < 1) ws = 1;
   if (hs < 1) hs = 1;
   float f_scaled = H->focal_px * ((float)ws / (float)W);
-  int numDisp = (int)ceil(f_scaled * H->baseline_m / H->zmin_m / 16.0f) * 16;
-  if (numDisp < 16) numDisp = 16;
-  if (numDisp >= ws) {
+  float search = ceilf(f_scaled * H->baseline_m / H->zmin_m / 16.0f) * 16;
+  if (search < 16) search = 16;
+  if (!std::isfinite(search) || search >= ws) {
     snprintf(H->err, sizeof(H->err),
-             "disparity search %d exceeds scaled width %d", numDisp, ws);
+             "disparity search %.0f exceeds scaled width %d", search, ws);
     return -1;
   }
+  int numDisp = (int)search;
 
   if (W != H->w || Ht != H->h || ws != H->ws || hs != H->hs) {
     free_bufs(H);
@@ -260,11 +304,11 @@ int rs_depth_range_process(RsDepthRange h, const uint8_t *ir_left,
   k_census<<<gs, bs>>>(H->d_ir, ws, hs, H->d_cenR);
   k_match<<<gs, bs>>>(H->d_cenL, H->d_cenR, ws, hs, numDisp, H->uniqueness,
                        f_scaled, H->baseline_m, H->d_z);
-  k_median5<<<gs, bs>>>(H->d_z, ws, hs, H->d_zmed);
-  int use_crop = (H->crop[0] >= 0 && H->crop[2] > H->crop[0] &&
-                  H->crop[1] >= 0 && H->crop[3] > H->crop[1]);
-  k_merge<<<gf, bs>>>(H->d_zmed, ws, hs, H->d_hw, H->d_out, W, Ht,
-                       H->min_z_mm, (int)(H->zmin_m * 1000.0f),
+  if (H->use_median)
+    k_median5<<<gs, bs>>>(H->d_z, ws, hs, H->d_zmed);
+  k_merge<<<gf, bs>>>(H->use_median ? H->d_zmed : H->d_z,
+                       ws, hs, H->d_hw, H->d_out, W, Ht,
+                       H->min_z_mm, (int)ceilf(H->zmin_m * 1000.0f),
                        H->crop[0], H->crop[1], H->crop[2], H->crop[3],
                        use_crop);
   CUDA_OK(cudaGetLastError(), H, "kernel launch");

@@ -63,6 +63,12 @@ int rs_depth_range_process(
 
 const char* rs_depth_range_last_error(RsDepthRange h);
 
+/* Project-specific extension; leaves the original four entry points intact.
+ * Minimum depth is in metres. Returns 0 on success, -1 for invalid settings.
+ * Legacy create() chooses 20 mm for baselines <30 mm, otherwise 120 mm.
+ */
+int rs_depth_range_configure(RsDepthRange h, float min_depth_m, int use_median);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
